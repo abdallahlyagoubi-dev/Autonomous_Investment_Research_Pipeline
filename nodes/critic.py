@@ -1,0 +1,105 @@
+# Member 4 — Critic Node + Conditional Routing
+# Scores the completeness of gathered research.
+# If score < THRESHOLD and iterations < MAX, routes back to search.
+
+from datetime import date
+from typing import Literal
+
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+from state import ResearchState
+from llm import llm
+
+MAX_ITERATIONS = 3
+SCORE_THRESHOLD = 7.0
+
+
+# ── Structured output schema ───────────────────────────────────────
+
+class CriticOutput(BaseModel):
+    score: float = Field(
+        description="Completeness score from 0 to 10. 7+ means sufficient to write a memo."
+    )
+    missing_topics: list[str] = Field(
+        description="List of topics still missing or under-researched. Empty if score >= 7."
+    )
+    reasoning: str = Field(
+        description="Brief explanation of the score."
+    )
+
+
+CRITIC_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a senior equity research analyst reviewing gathered data.
+Today's date is {today}. Evaluate whether the information is sufficient to
+write a professional investment memo.
+
+Check these five dimensions explicitly. Dock points for each one that is
+missing, vague, or stale (older than ~12 months for time-sensitive items):
+  1. Recent news / material events (within the last ~12 months)
+  2. Quantitative financials — concrete numbers: revenue, net income, EPS,
+     margins, year-over-year growth, and forward guidance
+  3. Valuation — analyst ratings, price targets, P/E, market cap
+  4. Competitive landscape — named competitors and relative positioning
+  5. Specific, concrete risk factors
+
+Scoring guide (0–10):
+  9–10 : All five dimensions covered with concrete, current data
+  7–8  : Sufficient — minor gaps, memo can be written
+  5–6  : Partial — one or more dimensions weak or missing numbers
+  0–4  : Insufficient — critical information missing
+
+Be strict, especially about MISSING QUANTITATIVE FINANCIALS — a memo with no
+real numbers is not acceptable. A score of 7 or above means we proceed.
+
+For missing_topics, write SEARCH-READY phrases (specific terms a search
+engine can use), not abstract labels. Empty list if score >= 7."""),
+    ("human", """Stock: {ticker}
+
+--- Web Search Results ---
+{search_results}
+
+--- Earnings / RAG Context ---
+{rag_context}
+
+Evaluate completeness across all five dimensions."""),
+])
+
+critic_chain = CRITIC_PROMPT | llm.with_structured_output(CriticOutput)
+
+
+# ── Node ───────────────────────────────────────────────────────────
+
+def critic_node(state: ResearchState) -> dict:
+    """Score the research and identify any gaps."""
+    search_text = "\n\n".join(state.get("search_results", []))
+    result: CriticOutput = critic_chain.invoke({
+        "ticker":         state["ticker"],
+        "today":          date.today().isoformat(),
+        "search_results": search_text or "None",
+        "rag_context":    state.get("rag_context", "None"),
+    })
+
+    print(f"[Critic] Score: {result.score}/10  |  Iteration: {state.get('iteration', 0)}")
+    if result.missing_topics:
+        print(f"[Critic] Missing: {result.missing_topics}")
+
+    return {
+        "score":          result.score,
+        "missing_topics": result.missing_topics,
+        "critique":       result.reasoning,
+    }
+
+
+# ── Conditional edge function ──────────────────────────────────────
+
+def route_after_critic(state: ResearchState) -> Literal["search", "writer"]:
+    """Decide whether to loop back for more research or proceed to writing."""
+    if state.get("iteration", 0) >= MAX_ITERATIONS:
+        print(f"[Router] Max iterations reached — proceeding to writer.")
+        return "writer"
+    if state.get("score", 0) >= SCORE_THRESHOLD:
+        print(f"[Router] Score {state['score']} >= {SCORE_THRESHOLD} — proceeding to writer.")
+        return "writer"
+    print(f"[Router] Score {state['score']} < {SCORE_THRESHOLD} — looping back to search.")
+    return "search"
